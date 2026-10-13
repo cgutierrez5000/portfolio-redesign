@@ -1,0 +1,131 @@
+name: Deploy Carlogia to SiteGround
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: carlogia-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          lfs: true
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: '10.34.3' # Matches the repository's .mise.toml.
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build website
+        run: pnpm run build
+
+      - name: Deploy frontend
+        shell: bash
+        env:
+          SG_HOST: ${{ secrets.SG_HOST }}
+          SG_USER: ${{ secrets.SG_USER }}
+          SG_PORT: ${{ secrets.SG_PORT }}
+          SG_PATH: ${{ secrets.SG_PATH }}
+          SG_SSH_KEY: ${{ secrets.SG_SSH_KEY }}
+          SG_SSH_PASSPHRASE: ${{ secrets.SG_SSH_PASSPHRASE }}
+          SG_KNOWN_HOSTS: ${{ secrets.SG_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+
+          for name in SG_HOST SG_USER SG_PORT SG_PATH SG_SSH_KEY SG_SSH_PASSPHRASE SG_KNOWN_HOSTS; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Missing GitHub Actions secret: $name"
+              exit 1
+            fi
+          done
+
+          # Restrict connection values to simple hostnames, usernames and paths.
+          [[ "$SG_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]]
+          [[ "$SG_USER" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$ ]]
+          [[ "$SG_PORT" =~ ^[0-9]+$ ]]
+          [[ "$SG_PATH" =~ ^/[a-zA-Z0-9_./-]+/public_html$ ]]
+          [[ "$SG_PATH" != *".."* ]]
+          test -s dist/index.html
+
+          ssh_dir="$(mktemp -d "$RUNNER_TEMP/carlogia-ssh.XXXXXX")"
+          cleanup() {
+            if [[ -n "${SSH_AGENT_PID:-}" ]]; then
+              ssh-agent -k >/dev/null 2>&1 || true
+            fi
+            rm -rf "$ssh_dir"
+          }
+          trap cleanup EXIT
+          chmod 700 "$ssh_dir"
+          printf '%s\n' "$SG_SSH_KEY" > "$ssh_dir/key"
+          printf '%s\n' "$SG_KNOWN_HOSTS" > "$ssh_dir/known_hosts"
+          chmod 600 "$ssh_dir/key" "$ssh_dir/known_hosts"
+
+          # Unlock the key in memory; the passphrase is supplied from a secret.
+          cat > "$ssh_dir/askpass" <<'EOF'
+          #!/usr/bin/env bash
+          printf '%s\n' "$SG_SSH_PASSPHRASE"
+          EOF
+          chmod 700 "$ssh_dir/askpass"
+          eval "$(ssh-agent -s)" >/dev/null
+          SSH_ASKPASS="$ssh_dir/askpass" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
+            ssh-add "$ssh_dir/key" </dev/null
+
+          cat > "$ssh_dir/config" <<EOF
+          Host carlogia-deploy
+            HostName $SG_HOST
+            User $SG_USER
+            Port $SG_PORT
+            IdentityFile $ssh_dir/key
+            IdentitiesOnly yes
+            BatchMode yes
+            StrictHostKeyChecking yes
+            UserKnownHostsFile $ssh_dir/known_hosts
+            ConnectTimeout 20
+          EOF
+          chmod 600 "$ssh_dir/config"
+
+          # Confirm the target exists and that the server supports rsync.
+          ssh -F "$ssh_dir/config" carlogia-deploy \
+            "test -d '$SG_PATH' && command -v rsync >/dev/null"
+
+          # Preserve server-managed files. Keep old hashed assets for open tabs.
+          # Deliberately omit --delete: this deployment owns only uploaded files.
+          rsync -rz --omit-dir-times --no-perms --no-owner --no-group \
+            --chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r \
+            --exclude='/index.html' \
+            --exclude='/api/' \
+            --exclude='/private/' \
+            --exclude='/.htaccess' \
+            --exclude='*.php' \
+            -e "ssh -F $ssh_dir/config" \
+            dist/ "carlogia-deploy:$SG_PATH/"
+
+          # Publish the new entry point only after its assets have arrived.
+          rsync -rz --no-perms --no-owner --no-group --chmod=Fu=rw,Fgo=r \
+            -e "ssh -F $ssh_dir/config" \
+            dist/index.html "carlogia-deploy:$SG_PATH/index.html"
+
+          echo "Frontend deployment completed."
