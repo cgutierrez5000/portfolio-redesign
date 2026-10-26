@@ -509,7 +509,7 @@ function App() {
               System<span className="title-dot title-dot--red">.</span>
             </h2>
             <p>
-              I built CT Ticket System to turn my experience managing web-development tickets into a full-stack application.
+              I built CT Ticket System (Client Tracking Ticket System) to turn my experience managing web-development tickets into a full-stack application.
               It lets a small team create, prioritize, assign, and track tickets, with authenticated access and role-based permissions.
             </p>
             <div className="inline-links">
